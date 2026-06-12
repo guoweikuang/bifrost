@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -28,6 +29,7 @@ import (
 	"github.com/maximhq/bifrost/plugins/governance"
 	"github.com/maximhq/bifrost/plugins/governance/complexity"
 	"github.com/maximhq/bifrost/plugins/logging"
+	"github.com/maximhq/bifrost/plugins/otel"
 	"github.com/maximhq/bifrost/plugins/prompts"
 	"github.com/maximhq/bifrost/plugins/semanticcache"
 	"github.com/maximhq/bifrost/plugins/telemetry"
@@ -833,6 +835,7 @@ func (s *BifrostHTTPServer) ReloadClientConfigFromConfigStore(ctx context.Contex
 	if s.AuthMiddleware != nil {
 		s.AuthMiddleware.UpdateWhitelistedRoutes(config.WhitelistedRoutes)
 		s.AuthMiddleware.UpdateTempTokenAuthEnabled(config.MCPEnableTempTokenAuth)
+		s.AuthMiddleware.UpdateEnforceAuthOnInference(config.EnforceAuthOnInference)
 	}
 	// Reloading config in bifrost client
 	if s.Client != nil {
@@ -1337,8 +1340,10 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	// Initializing plugin specific handlers
 	var loggingHandler *handlers.LoggingHandler
 	loggerPlugin, _ := lib.FindPluginAs[*logging.LoggerPlugin](s.Config, logging.PluginName)
+	var govLogManager logging.LogManager
 	if loggerPlugin != nil {
 		loggingHandler = handlers.NewLoggingHandler(loggerPlugin.GetPluginLogManager(), s, s.Config)
+		govLogManager = loggerPlugin.GetPluginLogManager()
 	}
 	var governanceHandler *handlers.GovernanceHandler
 	governancePluginName := governance.PluginName
@@ -1347,7 +1352,7 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 	}
 	governancePlugin, _ := lib.FindPluginAs[schemas.LLMPlugin](s.Config, governancePluginName)
 	if governancePlugin != nil {
-		governanceHandler, err = handlers.NewGovernanceHandler(callbacks, s.Config.ConfigStore)
+		governanceHandler, err = handlers.NewGovernanceHandler(callbacks, s.Config.ConfigStore, govLogManager)
 		if err != nil {
 			return fmt.Errorf("failed to initialize governance handler: %v", err)
 		}
@@ -1505,6 +1510,29 @@ func (s *BifrostHTTPServer) PrepareCommonMiddlewares() []schemas.BifrostHTTPMidd
 	} else {
 		logger.Warn("prometheus plugin not found, skipping telemetry middleware")
 	}
+	// OTel HTTP metrics (http_requests_total etc., pushed via OTLP). The otel plugin is
+	// resolved per request rather than captured here: a config reload swaps in a freshly
+	// constructed plugin instance, and a pointer captured at startup would keep recording
+	// against exporters whose meter provider has been shut down.
+	commonMiddlewares = append(commonMiddlewares, func(next fasthttp.RequestHandler) fasthttp.RequestHandler {
+		return func(ctx *fasthttp.RequestCtx) {
+			start := time.Now()
+			reqSize := float64(ctx.Request.Header.ContentLength())
+			next(ctx)
+			otelPlugin, err := lib.FindPluginAs[*otel.OtelPlugin](s.Config, otel.PluginName)
+			if err != nil {
+				return
+			}
+			otelPlugin.RecordHTTPMetrics(ctx,
+				string(ctx.Path()),
+				string(ctx.Method()),
+				strconv.Itoa(ctx.Response.StatusCode()),
+				time.Since(start).Seconds(),
+				reqSize,
+				float64(ctx.Response.Header.ContentLength()),
+			)
+		}
+	})
 	return commonMiddlewares
 }
 
@@ -1756,11 +1784,13 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	}
 	// Register UI handler
 	s.RegisterUIRoutes()
+	// Checking if config has server config and use it to set read buffer size
+	logger.Debug("server buffer size: %d", s.Config.ServerConfig.ReadBufferSize)
 	// Create fasthttp server instance
 	s.Server = &fasthttp.Server{
 		Handler:            handlers.SecurityHeadersMiddleware()(handlers.CorsMiddleware(s.Config)(handlers.RequestDecompressionMiddleware(s.Config)(s.Router.Handler))),
 		MaxRequestBodySize: s.Config.ClientConfig.MaxRequestBodySizeMB * 1024 * 1024,
-		ReadBufferSize:     1024 * 64, // 64kb
+		ReadBufferSize:     s.Config.ServerConfig.ReadBufferSize,
 	}
 	return nil
 }

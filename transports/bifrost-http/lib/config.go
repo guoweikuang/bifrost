@@ -146,6 +146,10 @@ type pluginOrderInfo struct {
 	Order     int
 }
 
+type ServerConfig struct {
+	ReadBufferSize int `json:"read_buffer_size,omitempty"`
+}
+
 // ConfigData represents the configuration data for the Bifrost HTTP transport.
 // It contains the client configuration, provider configurations, MCP configuration,
 // vector store configuration, config store configuration, and logs store configuration.
@@ -155,6 +159,7 @@ type ConfigData struct {
 	// empty = deny all, ["*"] = allow all. Setting it to 1 restores v1.4.x semantics:
 	// empty = allow all (equivalent to ["*"]).
 	Version       int                       `json:"version,omitempty"`
+	Server        *ServerConfig             `json:"server,omitempty"`
 	SourceOfTruth string                    `json:"source_of_truth,omitempty"`
 	Client        *configstore.ClientConfig `json:"client"`
 	EncryptionKey *schemas.EnvVar           `json:"encryption_key"`
@@ -337,6 +342,7 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 		Version           int                                   `json:"version,omitempty"`
 		SourceOfTruth     string                                `json:"source_of_truth,omitempty"`
 		FrameworkConfig   json.RawMessage                       `json:"framework,omitempty"`
+		Server            *ServerConfig                         `json:"server,omitempty"`
 		Client            *configstore.ClientConfig             `json:"client"`
 		EncryptionKey     *schemas.EnvVar                       `json:"encryption_key"`
 		AuthConfig        *configstore.AuthConfig               `json:"auth_config,omitempty"`
@@ -360,6 +366,7 @@ func (cd *ConfigData) UnmarshalJSON(data []byte) error {
 	cd.Version = temp.Version
 	cd.SourceOfTruth = normalizeSourceOfTruth(temp.SourceOfTruth)
 	cd.Client = temp.Client
+	cd.Server = temp.Server
 	cd.EncryptionKey = temp.EncryptionKey
 	cd.AuthConfig = temp.AuthConfig
 	cd.Providers = temp.Providers
@@ -445,6 +452,7 @@ type Config struct {
 	LogsStore   logstore.LogStore
 
 	// In-memory storage
+	ServerConfig     *ServerConfig
 	ClientConfig     *configstore.ClientConfig
 	Providers        map[schemas.ModelProvider]configstore.ProviderConfig
 	MCPConfig        *schemas.MCPConfig
@@ -780,10 +788,6 @@ func LoadConfig(ctx context.Context, configDirPath string) (*Config, error) {
 			fmt.Println("")
 			logger.Warn("config file %s does not include \"$schema\":\"https://www.getbifrost.ai/schema\". Use our official schema file to avoid unexpected behavior.", absConfigFilePath)
 		}
-		// Validate config file against the schema
-		if err := ValidateConfigSchema(data); err != nil {
-			logger.Error("config validation failed: %v. You can find the official schema at https://www.getbifrost.ai/schema. Some features may not work as expected unless you fix the config file.", err)
-		}
 		// Parse config data
 		if err := json.Unmarshal(data, &configData); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal config: %w", err)
@@ -845,6 +849,14 @@ func LoadConfig(ctx context.Context, configDirPath string) (*Config, error) {
 		wsConfig := &schemas.WebSocketConfig{}
 		wsConfig.CheckAndSetDefaults()
 		config.WebSocketConfig = wsConfig
+	}
+	// 13. Server config
+	if configData.Server != nil {
+		config.ServerConfig = configData.Server
+	} else {
+		config.ServerConfig = &ServerConfig{
+			ReadBufferSize: 1024 * 64,
+		}
 	}
 	return config, nil
 }
@@ -1160,14 +1172,7 @@ func loadProviders(ctx context.Context, config *Config, configData *ConfigData) 
 		for providerName, providerCfgInFile := range configData.Providers {
 			provider := schemas.ModelProvider(strings.ToLower(providerName))
 			existingCfg, exists := providersInConfigStore[provider]
-			if err = processAuthoritativeProvider(providerName, providerCfgInFile, existingCfg, exists, authoritativeProviders); err != nil {
-				logger.Warn("failed to process provider %s: %v", providerName, err)
-				// Preserve the existing persisted config so a single bad file entry
-				// does not prune the provider (and its DB-only keys) from the store.
-				if exists {
-					authoritativeProviders[provider] = existingCfg
-				}
-			}
+			processAuthoritativeProvider(providerName, providerCfgInFile, existingCfg, exists, authoritativeProviders)
 		}
 		providersInConfigStore = authoritativeProviders
 	} else {
@@ -1279,10 +1284,10 @@ func processAuthoritativeProvider(
 	existingCfg configstore.ProviderConfig,
 	exists bool,
 	providers map[schemas.ModelProvider]configstore.ProviderConfig,
-) error {
+) {
 	provider := schemas.ModelProvider(strings.ToLower(providerName))
 	if err := ValidateCustomProvider(providerCfgInFile, provider); err != nil {
-		return err
+		logger.Warn("invalid custom provider config for %s (writing through): %v", provider, err)
 	}
 	baseProvider := provider
 	if providerCfgInFile.CustomProviderConfig != nil && providerCfgInFile.CustomProviderConfig.BaseProviderType != "" {
@@ -1293,7 +1298,7 @@ func processAuthoritativeProvider(
 			providerCfgInFile.Keys[i].ID = uuid.NewString()
 		}
 		if err := providerKeyInFile.Aliases.Validate(baseProvider); err != nil {
-			return fmt.Errorf("invalid aliases for key %q in provider %s: %w", providerKeyInFile.Name, provider, err)
+			logger.Warn("invalid aliases for key %q in provider %s (writing through): %v", providerKeyInFile.Name, provider, err)
 		}
 	}
 	fileProviderConfigHash, err := providerCfgInFile.GenerateConfigHash(string(provider))
@@ -1307,7 +1312,6 @@ func processAuthoritativeProvider(
 		providerCfgInFile.Description = existingCfg.Description
 	}
 	providers[provider] = providerCfgInFile
-	return nil
 }
 
 // mergeProviderWithHash merges provider config using hash-based reconciliation
@@ -2074,7 +2078,13 @@ func mergeGovernanceConfig(ctx context.Context, config *Config, configData *Conf
 
 		found := false
 		for j, existingCustomer := range governanceConfig.Customers {
-			if existingCustomer.ID == newCustomer.ID {
+			idMatch := existingCustomer.ID == newCustomer.ID
+			nameMatch := newCustomer.ID == "" && existingCustomer.Name == newCustomer.Name
+			if idMatch || nameMatch {
+				if nameMatch {
+					// Config file has no ID; adopt the DB record's ID so updates use the right primary key.
+					configData.Governance.Customers[i].ID = existingCustomer.ID
+				}
 				found = true
 				if existingCustomer.ConfigHash != fileCustomerHash {
 					logger.Debug("config hash mismatch for customer %s, syncing from config file", newCustomer.ID)
@@ -2089,6 +2099,9 @@ func mergeGovernanceConfig(ctx context.Context, config *Config, configData *Conf
 		}
 		if !found {
 			configData.Governance.Customers[i].ConfigHash = fileCustomerHash
+			if configData.Governance.Customers[i].ID == "" {
+				configData.Governance.Customers[i].ID = uuid.NewString()
+			}
 			customersToAdd = append(customersToAdd, configData.Governance.Customers[i])
 		}
 	}
@@ -2105,7 +2118,13 @@ func mergeGovernanceConfig(ctx context.Context, config *Config, configData *Conf
 
 		found := false
 		for j, existingTeam := range governanceConfig.Teams {
-			if existingTeam.ID == newTeam.ID {
+			idMatch := existingTeam.ID == newTeam.ID
+			nameMatch := newTeam.ID == "" && existingTeam.Name == newTeam.Name
+			if idMatch || nameMatch {
+				if nameMatch {
+					// Config file has no ID; adopt the DB record's ID so updates use the right primary key.
+					configData.Governance.Teams[i].ID = existingTeam.ID
+				}
 				found = true
 				if existingTeam.ConfigHash != fileTeamHash {
 					logger.Debug("config hash mismatch for team %s, syncing from config file", newTeam.ID)
@@ -2120,6 +2139,9 @@ func mergeGovernanceConfig(ctx context.Context, config *Config, configData *Conf
 		}
 		if !found {
 			configData.Governance.Teams[i].ConfigHash = fileTeamHash
+			if configData.Governance.Teams[i].ID == "" {
+				configData.Governance.Teams[i].ID = uuid.NewString()
+			}
 			teamsToAdd = append(teamsToAdd, configData.Governance.Teams[i])
 		}
 	}
@@ -2136,10 +2158,16 @@ func mergeGovernanceConfig(ctx context.Context, config *Config, configData *Conf
 		// Preparing hash
 		found := false
 		for j, existingVirtualKey := range governanceConfig.VirtualKeys {
-			if existingVirtualKey.ID == newVirtualKey.ID {
+			idMatch := existingVirtualKey.ID == newVirtualKey.ID
+			nameMatch := newVirtualKey.ID == "" && existingVirtualKey.Name == newVirtualKey.Name
+			if idMatch || nameMatch {
+				if nameMatch {
+					// Config file has no ID; adopt the DB record's ID so updates use the right primary key.
+					configData.Governance.VirtualKeys[i].ID = existingVirtualKey.ID
+				}
 				found = true
 				if existingVirtualKey.ConfigHash != fileVKHash {
-					logger.Debug("config hash mismatch for virtual key %s, syncing from config file", newVirtualKey.ID)
+					logger.Debug("config hash mismatch for virtual key %s, syncing from config file", existingVirtualKey.ID)
 					configData.Governance.VirtualKeys[i].ConfigHash = fileVKHash
 					// This is added for backward compatibility with existing configs
 					if configData.Governance.VirtualKeys[i].Value == "" && existingVirtualKey.Value != "" {
@@ -2175,6 +2203,9 @@ func mergeGovernanceConfig(ctx context.Context, config *Config, configData *Conf
 		}
 		if !found {
 			configData.Governance.VirtualKeys[i].ConfigHash = fileVKHash
+			if configData.Governance.VirtualKeys[i].ID == "" {
+				configData.Governance.VirtualKeys[i].ID = uuid.NewString()
+			}
 			// if the virtual key value is env.VIRTUAL_KEY_VALUE, then we will need to resolve the environment variable
 			// Process environment variable for virtual key value
 			if strings.HasPrefix(configData.Governance.VirtualKeys[i].Value, "env.") {
@@ -2339,6 +2370,7 @@ func mergeGovernanceConfig(ctx context.Context, config *Config, configData *Conf
 	config.GovernanceConfig.PricingOverrides = append(governanceConfig.PricingOverrides, pricingOverridesToAdd...)
 	config.GovernanceConfig.ModelConfigs = append(governanceConfig.ModelConfigs, modelConfigsToAdd...)
 	config.GovernanceConfig.Providers = append(governanceConfig.Providers, providersToAdd...)
+	complexityAnalyzerConfigToUpdate := planComplexityAnalyzerConfigUpdate(config, configData)
 	// Update store with merged config items
 	hasChanges := len(budgetsToAdd) > 0 || len(budgetsToUpdate) > 0 ||
 		len(rateLimitsToAdd) > 0 || len(rateLimitsToUpdate) > 0 ||
@@ -2348,7 +2380,11 @@ func mergeGovernanceConfig(ctx context.Context, config *Config, configData *Conf
 		len(routingRulesToAdd) > 0 || len(routingRulesToUpdate) > 0 ||
 		len(pricingOverridesToAdd) > 0 || len(pricingOverridesToUpdate) > 0 ||
 		len(modelConfigsToAdd) > 0 || len(modelConfigsToUpdate) > 0 ||
-		len(providersToAdd) > 0 || len(providersToUpdate) > 0
+		len(providersToAdd) > 0 || len(providersToUpdate) > 0 ||
+		complexityAnalyzerConfigToUpdate != nil
+	if config.ConfigStore == nil && complexityAnalyzerConfigToUpdate != nil {
+		config.GovernanceConfig.ComplexityAnalyzerConfig = complexityAnalyzerConfigToUpdate
+	}
 	if config.ConfigStore != nil && hasChanges {
 		err := updateGovernanceConfigInStore(ctx, config,
 			budgetsToAdd, budgetsToUpdate,
@@ -2359,25 +2395,10 @@ func mergeGovernanceConfig(ctx context.Context, config *Config, configData *Conf
 			routingRulesToAdd, routingRulesToUpdate,
 			pricingOverridesToAdd, pricingOverridesToUpdate,
 			modelConfigsToAdd, modelConfigsToUpdate,
-			providersToAdd, providersToUpdate)
+			providersToAdd, providersToUpdate,
+			complexityAnalyzerConfigToUpdate)
 		if err != nil {
 			logger.Fatal("failed to sync governance config: %v", err)
-		}
-	}
-
-	// File config stays authoritative for analyzer tuning when present.
-	if configData.Governance.ComplexityAnalyzerConfig != nil {
-		normalized, err := complexity.ValidateAndNormalize(configData.Governance.ComplexityAnalyzerConfig)
-		if err != nil {
-			logger.Error("invalid complexity analyzer config in config file: %v", err)
-		} else if normalized != nil {
-			current := config.GovernanceConfig.ComplexityAnalyzerConfig
-			config.GovernanceConfig.ComplexityAnalyzerConfig = normalized
-			if config.ConfigStore != nil && (current == nil || !reflect.DeepEqual(current, normalized)) {
-				if err := config.ConfigStore.UpdateComplexityAnalyzerConfig(ctx, normalized); err != nil {
-					logger.Warn("failed to sync complexity analyzer config from config file: %v", err)
-				}
-			}
 		}
 	}
 
@@ -2400,6 +2421,86 @@ func mergeGovernanceConfig(ctx context.Context, config *Config, configData *Conf
 	if configData.isConfigJSONSourceOfTruth() {
 		pruneGovernanceConfigToFile(ctx, config, configData)
 	}
+}
+
+// planComplexityAnalyzerConfigUpdate applies config.json complexity analyzer
+// reconciliation rules and returns the next singleton config when it should be
+// persisted. Store writes happen in updateGovernanceConfigInStore with the rest
+// of the planned governance updates.
+//
+// In split mode, unchanged section hashes preserve runtime UI/API edits. When a
+// section changes in config.json, tier boundaries are replaced and keyword lists
+// are merged additively with the stored runtime lists.
+func planComplexityAnalyzerConfigUpdate(config *Config, configData *ConfigData) *configstore.ComplexityAnalyzerConfig {
+	if config == nil || configData == nil || configData.Governance == nil || configData.Governance.ComplexityAnalyzerConfig == nil {
+		return nil
+	}
+	if config.GovernanceConfig == nil {
+		config.GovernanceConfig = &configstore.GovernanceConfig{}
+	}
+
+	fileConfig, fileHashes, ok := complexityAnalyzerConfigFromFile(configData)
+	if !ok {
+		return nil
+	}
+	current := config.GovernanceConfig.ComplexityAnalyzerConfig
+	if configData.isConfigJSONSourceOfTruth() {
+		if current != nil && reflect.DeepEqual(current, fileConfig) {
+			return nil
+		}
+		return fileConfig
+	}
+	if current != nil && current.ConfigHashes.Empty() {
+		normalized := current.Normalized()
+		normalized.ConfigHashes = fileHashes
+		logger.Debug("complexity analyzer config missing section hashes, backfilling without applying config file values")
+		if reflect.DeepEqual(current, &normalized) {
+			return nil
+		}
+		return &normalized
+	}
+	if current != nil && current.ConfigHashes.Equal(fileHashes) {
+		logger.Debug("complexity analyzer config section hashes match, keeping DB config")
+		return nil
+	}
+
+	merged, err := mergeComplexityAnalyzerConfigFromFile(current, fileConfig)
+	if err != nil {
+		logger.Warn("failed to merge complexity analyzer config from config file: %v", err)
+		return nil
+	}
+	if current != nil && reflect.DeepEqual(current, merged) {
+		return nil
+	}
+	return merged
+}
+
+// complexityAnalyzerConfigFromFile validates the file-backed analyzer config and
+// returns the canonical section hashes used to detect whether config.json changed.
+func complexityAnalyzerConfigFromFile(configData *ConfigData) (*configstore.ComplexityAnalyzerConfig, configstore.ComplexityAnalyzerConfigHashes, bool) {
+	fileConfig, err := complexity.ValidateAndNormalize(configData.Governance.ComplexityAnalyzerConfig)
+	if err != nil {
+		logger.Error("invalid complexity analyzer config in config file: %v", err)
+		return nil, configstore.ComplexityAnalyzerConfigHashes{}, false
+	}
+	fileHashes, err := configstore.GenerateComplexityAnalyzerConfigHashes(fileConfig)
+	if err != nil {
+		logger.Warn("failed to generate complexity analyzer config hashes: %v", err)
+		return nil, configstore.ComplexityAnalyzerConfigHashes{}, false
+	}
+	fileConfig.ConfigHashes = fileHashes
+	return fileConfig, fileHashes, true
+}
+
+// mergeComplexityAnalyzerConfigFromFile uses defaults as the first split-mode
+// base so config.json seeds do not erase built-in keyword coverage.
+func mergeComplexityAnalyzerConfigFromFile(current, fileConfig *configstore.ComplexityAnalyzerConfig) (*configstore.ComplexityAnalyzerConfig, error) {
+	base := current
+	if base == nil {
+		defaults := complexity.DefaultAnalyzerConfig()
+		base = &defaults
+	}
+	return configstore.MergeComplexityAnalyzerConfigByHashes(base, fileConfig)
 }
 
 // pruneGovernanceConfigToFile removes DB-only governance rows for file-present collections.
@@ -2577,6 +2678,7 @@ func updateGovernanceConfigInStore(
 	modelConfigsToUpdate []configstoreTables.TableModelConfig,
 	providersToAdd []configstoreTables.TableProvider,
 	providersToUpdate []configstoreTables.TableProvider,
+	complexityAnalyzerConfigToUpdate *configstore.ComplexityAnalyzerConfig,
 ) error {
 	logger.Debug("updating governance config in store with merged items")
 	return config.ConfigStore.ExecuteTransaction(ctx, func(tx *gorm.DB) error {
@@ -2959,6 +3061,14 @@ func updateGovernanceConfigInStore(
 			}
 		}
 
+		if complexityAnalyzerConfigToUpdate != nil {
+			if err := config.ConfigStore.UpdateComplexityAnalyzerConfig(ctx, complexityAnalyzerConfigToUpdate, tx); err != nil {
+				logger.Warn("failed to sync complexity analyzer config from config file: %v", err)
+			} else {
+				config.GovernanceConfig.ComplexityAnalyzerConfig = complexityAnalyzerConfigToUpdate
+			}
+		}
+
 		return nil
 	})
 }
@@ -3334,6 +3444,10 @@ func createGovernanceConfigInStore(ctx context.Context, config *Config) {
 			virtualKey.ProviderConfigs = nil
 			virtualKey.MCPConfigs = nil
 
+			if virtualKey.ID == "" {
+				virtualKey.ID = uuid.NewString()
+			}
+
 			if err := config.ConfigStore.CreateVirtualKey(ctx, virtualKey, tx); err != nil {
 				logger.Error("failed to create virtual key %s: %v", virtualKey.ID, err)
 				return fmt.Errorf("failed to create virtual key %s: %w", virtualKey.ID, err)
@@ -3430,6 +3544,11 @@ func createGovernanceConfigInStore(ctx context.Context, config *Config) {
 			if err != nil {
 				logger.Warn("invalid complexity analyzer config in config file: %v", err)
 			} else if normalized != nil {
+				fileHashes, err := configstore.GenerateComplexityAnalyzerConfigHashes(normalized)
+				if err != nil {
+					return fmt.Errorf("failed to generate complexity analyzer config hashes: %w", err)
+				}
+				normalized.ConfigHashes = fileHashes
 				config.GovernanceConfig.ComplexityAnalyzerConfig = normalized
 				if err := config.ConfigStore.UpdateComplexityAnalyzerConfig(ctx, normalized, tx); err != nil {
 					return fmt.Errorf("failed to create complexity analyzer config: %w", err)
@@ -3520,8 +3639,7 @@ func loadAuthConfig(ctx context.Context, config *Config, configData *ConfigData)
 	// If DB already matches file config, skip hashing and DB write
 	if dbAuthConfig != nil {
 		usernameMatch := dbAuthConfig.AdminUserName.GetValue() == authConfig.AdminUserName.GetValue()
-		boolsMatch := dbAuthConfig.IsEnabled == authConfig.IsEnabled &&
-			dbAuthConfig.DisableAuthOnInference == authConfig.DisableAuthOnInference
+		boolsMatch := dbAuthConfig.IsEnabled == authConfig.IsEnabled
 		var passwordMatch bool
 		if filePassword == "" {
 			passwordMatch = dbAuthConfig.AdminPassword.GetValue() == ""
@@ -3533,10 +3651,9 @@ func loadAuthConfig(ctx context.Context, config *Config, configData *ConfigData)
 		if usernameMatch && passwordMatch && boolsMatch {
 			// DB matches file -- use DB hash but preserve file env var references
 			config.GovernanceConfig.AuthConfig = &configstore.AuthConfig{
-				AdminUserName:          authConfig.AdminUserName,
-				AdminPassword:          preserveEnvVar(authConfig.AdminPassword, dbAuthConfig.AdminPassword.GetValue()),
-				IsEnabled:              authConfig.IsEnabled,
-				DisableAuthOnInference: authConfig.DisableAuthOnInference,
+				AdminUserName: authConfig.AdminUserName,
+				AdminPassword: preserveEnvVar(authConfig.AdminPassword, dbAuthConfig.AdminPassword.GetValue()),
+				IsEnabled:     authConfig.IsEnabled,
 			}
 			return
 		}
@@ -3563,10 +3680,9 @@ func loadAuthConfig(ctx context.Context, config *Config, configData *ConfigData)
 	}
 	// Build auth config with hashed password but preserve env var references
 	config.GovernanceConfig.AuthConfig = &configstore.AuthConfig{
-		AdminUserName:          authConfig.AdminUserName,
-		AdminPassword:          preserveEnvVar(authConfig.AdminPassword, hashedPassword),
-		IsEnabled:              authConfig.IsEnabled,
-		DisableAuthOnInference: authConfig.DisableAuthOnInference,
+		AdminUserName: authConfig.AdminUserName,
+		AdminPassword: preserveEnvVar(authConfig.AdminPassword, hashedPassword),
+		IsEnabled:     authConfig.IsEnabled,
 	}
 	// Persist to config store
 	if err := config.ConfigStore.UpdateAuthConfig(ctx, config.GovernanceConfig.AuthConfig); err != nil {
